@@ -1,0 +1,132 @@
+name: Unsigned IPA
+
+# Builds an unsigned .ipa from the OpenGlasses scheme (iPhone app + GlassesActivityWidget +
+# ShareExtension) on a GitHub-hosted macOS runner and uploads it as an artifact.
+#
+# No signing identity, provisioning profile or secrets are involved: the build runs with
+# CODE_SIGNING_ALLOWED=NO and the resulting .app is packaged into a bare Payload/ zip. The IPA is
+# intentionally unsigned — sideload it with a tool that signs on install, or sign it ad-hoc
+# afterwards with `codesign` for jailbroken/developer devices.
+#
+# Watch targets are skipped (OPENGLASSES_SKIP_WATCH=1): a Watch app is a separate bundle that a
+# typical sideload cannot install, so churning the archive for it buys nothing here. The toy store
+# upload settings in ExportOptions.plist are also irrelevant — nothing here runs xcodebuild export.
+#
+# Steps mirror .github/actions/xcode-project so this pipeline builds the same graph (pinned
+# XcodeGen, verified vendored binaries, frozen ci_scripts/Package.resolved) as the test pipeline.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unsigned-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          sw_vers
+
+      - name: Install XcodeGen (pinned, checksum-verified)
+        run: ./Scripts/install-xcodegen.sh
+
+      - name: Cache MediaPipe frameworks
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: Vendor/MediaPipeTasks/Frameworks
+          key: mediapipe-frameworks-${{ hashFiles('Scripts/fetch-mediapipe-frameworks.sh') }}
+
+      - name: Fetch MediaPipe frameworks
+        run: ./Scripts/fetch-mediapipe-frameworks.sh
+
+      - name: Fetch llama.cpp framework
+        run: ./Scripts/fetch-llamacpp-framework.sh
+
+      - name: Vendor digests survive the build
+        run: git diff --exit-code Vendor/LlamaCpp
+
+      - name: Cache SPM checkouts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .spm-checkouts
+          key: spm-${{ runner.os }}-${{ hashFiles('project.base.yml', 'ci_scripts/Package.resolved') }}
+          restore-keys: |
+            spm-${{ runner.os }}-
+
+      - name: Skip Watch and Tests targets
+        run: printf 'OPENGLASSES_SKIP_WATCH=1\nOPENGLASSES_SKIP_TESTS=1\n' > .openglasses-generate.env
+
+      - name: Generate Xcode project
+        run: ./Scripts/generate-xcodeproj.sh
+
+      - name: Freeze package resolution to the tracked lockfile
+        run: |
+          dst=OpenGlasses.xcodeproj/project.xcworkspace/xcshareddata/swiftpm
+          mkdir -p "$dst"
+          cp ci_scripts/Package.resolved "$dst/Package.resolved"
+          echo "Frozen to $(grep -c '"identity"' ci_scripts/Package.resolved) pins."
+
+      - name: Build unsigned .app
+        timeout-minutes: 70
+        run: |
+          set -o pipefail
+          xcodebuild build \
+            -project OpenGlasses.xcodeproj \
+            -scheme OpenGlasses \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath DerivedData \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
+            -clonedSourcePackagesDirPath .spm-checkouts \
+            -onlyUsePackageVersionsFromResolvedFile \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_STYLE=Manual \
+            CODE_SIGN_IDENTITY= \
+            SWIFT_EMIT_LOC_STRINGS=NO \
+            2>&1 | tee xcodebuild.log | grep --line-buffered -E "error:|\*\* BUILD" \
+            || { tail -100 xcodebuild.log; exit 1; }
+
+      - name: Package unsigned IPA
+        run: |
+          APP="DerivedData/Build/Products/Release-iphoneos/OpenGlasses.app"
+          test -d "$APP" || { echo "No built app at $APP"; exit 1; }
+          rm -rf Payload
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          ditto -c -k --sequesterRsrc --keepParent Payload OpenGlasses-unsigned.ipa
+          echo "IPA:" && ls -lh OpenGlasses-unsigned.ipa
+          echo "Architectures: $(lipo -archs "$APP/OpenGlasses")"
+
+      - name: Check the app bundle is unsigned
+        run: |
+          APP="DerivedData/Build/Products/Release-iphoneos/OpenGlasses.app"
+          if codesign -dv "$APP" 2>&1 | grep -q "code object is not signed"; then
+            echo "Confirmed: app bundle is unsigned."
+          else
+            echo "Warning: bundle appears to carry a signature:" && codesign -dv "$APP" 2>&1 && exit 1
+          fi
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: OpenGlasses-unsigned-ipa
+          path: OpenGlasses-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 30

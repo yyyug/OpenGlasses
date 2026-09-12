@@ -3,11 +3,9 @@ import SwiftUI
 struct AddModelView: View {
     @Environment(\.dismiss) private var dismiss
 
-    // Account sign-in state (Anthropic + ChatGPT + Google) — mirrors ModelFormView so the
-    // manager can tell "Add" is possible once a subscription/account flow is ready.
-    @ObservedObject private var claudeOAuth = ClaudeOAuthService.shared
+    // ChatGPT account sign-in state — mirrors ModelFormView so this view can tell "Add" is
+    // possible once the subscription flow is ready.
     @ObservedObject private var chatgptOAuth = ChatGPTOAuthService.shared
-    @ObservedObject private var googleOAuth = GoogleOAuthService.shared
 
     @State private var name: String = ""
     @State private var selectedProvider: LLMProvider = .anthropic
@@ -78,24 +76,16 @@ struct AddModelView: View {
 
     // MARK: - Pre-fill from existing saved model
 
-    /// Whether the "Add" button may be tapped for the current provider. The old rule
-    /// (`apiKey.isEmpty`) permanently disabled the button for the providers that have no API
-    /// key to paste — ChatGPT/Gemini-Vertex subscriptions, Apple Intelligence, and `.custom`
-    /// local servers whose key is optional — so a ChatGPT subscription model could never be
-    /// saved. Per provider: key providers need a key; account providers need the connection;
-    /// `.custom`/`.appleOnDevice` need nothing.
+    /// Whether the "Add" button may be tapped. The old rule (`apiKey.isEmpty`) permanently
+    /// disabled the button for a ChatGPT subscription, which authenticates via OAuth and has no
+    /// API key to paste — so a subscription model could never be saved. Only `.chatgpt` is
+    /// handled here; every other provider keeps its prior behavior.
     private var canAdd: Bool {
         switch selectedProvider {
         case .local:
             return !model.isEmpty
-        case .custom, .appleOnDevice:
-            return true
         case .chatgpt:
             return chatgptOAuth.isConnected
-        case .geminiVertex:
-            return googleOAuth.isConnected
-        case .anthropic:
-            return !apiKey.isEmpty || claudeOAuth.isConnected
         default:
             return !apiKey.isEmpty
         }
